@@ -1,0 +1,781 @@
+# %% [markdown]
+# # Quantum-Classical Hybrid Autoencoder for Medical Image Classification (GPU Optimized)
+# 
+# This notebook implements a hybrid quantum-classical model for chest X-ray classification.
+
+# %% [markdown]
+## Installation (Run if packages missing)
+
+# %%
+# Uncomment and run if you need to install packages
+#%pip install torch torchvision numpy pennylane medmnist timm matplotlib medvae
+
+# %% [markdown]
+## Imports and GPU Setup
+
+# %%
+import numpy as np
+import torch
+import torch.nn as nn
+import pennylane as qml
+from pennylane.qnn import TorchLayer
+from pennylane.operation import Operation
+import matplotlib.pyplot as plt
+from medvae import MVAE
+import time
+from IPython.display import display, update_display
+from torch.cuda.amp import autocast, GradScaler
+import os
+import pickle
+
+# Enable GPU optimizations
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+print("All imports successful!")
+print(f"PyTorch version: {torch.__version__}")
+print(f"PennyLane version: {qml.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+    print(f"CUDA version: {torch.version.cuda}")
+
+# %% [markdown]
+## Settings
+
+# %%
+n_qubits = 6
+q_M = 2                     # Number of identity blocks 
+q_L = 6                     # Number of layers per block
+latent_dim = q_M * n_qubits * 3
+img_size = 224              # (28, 64, 128, 224)
+batch_size = 128            # Increased for GPU
+n_epochs = 100
+n_workers = 4               # Optimal for GPU training
+prefetch_factor = 2         # Prefetch batches
+
+print(f"Configuration:")
+print(f"  Qubits: {n_qubits}")
+print(f"  Quantum Blocks: {q_M}")
+print(f"  Layers per Block: {q_L}")
+print(f"  Latent dimension: {latent_dim}")
+print(f"  Image size: {img_size}x{img_size}")
+print(f"  Batch size: {batch_size}")
+print(f"  Epochs: {n_epochs}")
+print(f"  Workers: {n_workers}")
+
+# %% [markdown]
+## GPU Monitoring Function
+
+# %%
+def print_gpu_stats():
+    if torch.cuda.is_available():
+        print(f"GPU Memory Allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+        print(f"GPU Memory Cached: {torch.cuda.memory_reserved()/1024**3:.2f} GB")
+        print(f"GPU Utilization: {torch.cuda.utilization()}%")
+
+# %% [markdown]
+## Load Data from preprocess.py
+
+# %%
+from preprocess import train_dataset, test_dataset
+
+print(f"Data loaded successfully!")
+print(f"Training samples: {len(train_dataset)}")
+print(f"Test samples: {len(test_dataset)}")
+
+# %% [markdown]
+## Filter Out Double-Labels
+
+# %%
+from torch.utils.data import Subset, DataLoader, Dataset
+
+# Filter training set and compute per-class positive counts
+train_single_label_indices = []
+pos_counts = torch.zeros(14, dtype=torch.float)
+for i in range(len(train_dataset)):
+    _, label = train_dataset[i]
+    if isinstance(label, np.ndarray):
+        lab = torch.from_numpy(label)
+    elif isinstance(label, torch.Tensor):
+        lab = label
+    else:
+        lab = torch.tensor(label)
+    lab = lab.squeeze()
+    if lab.ndim == 0:
+        if int(lab.item()) is not None:
+            if 0 <= int(lab.item()) < 14:
+                train_single_label_indices.append(i)
+                pos_counts[int(lab.item())] += 1
+    else:
+        if lab.sum() == 1:
+            train_single_label_indices.append(i)
+            pos_counts += lab.float()
+
+train_subset = Subset(train_dataset, train_single_label_indices)
+
+# Filter test set
+test_single_label_indices = []
+for i in range(len(test_dataset)):
+    _, label = test_dataset[i]
+    if isinstance(label, np.ndarray):
+        lab = torch.from_numpy(label)
+    elif isinstance(label, torch.Tensor):
+        lab = label
+    else:
+        lab = torch.tensor(label)
+    lab = lab.squeeze()
+    if lab.ndim == 0:
+        if int(lab.item()) is not None:
+            if 0 <= int(lab.item()) < 14:
+                test_single_label_indices.append(i)
+    else:
+        if lab.sum() == 1:
+            test_single_label_indices.append(i)
+
+test_subset = Subset(test_dataset, test_single_label_indices)
+
+# %%
+total_single_label_samples = len(train_single_label_indices) + len(test_single_label_indices)
+eps = 1e-6
+class_weight = total_single_label_samples / (pos_counts + eps)
+class_weight = class_weight / class_weight.mean()
+print(f"Filtered Training: {total_single_label_samples} single-label images ({len(train_subset)} batches)")
+print(f"Pos counts per class (from filtering): {pos_counts.tolist()}")
+print(f"Weight tensor: {class_weight.tolist()}")
+
+# %% [markdown]
+## Create Optimized DataLoaders
+
+# %%
+train_loader = DataLoader(
+    train_subset, 
+    batch_size=batch_size, 
+    shuffle=True, 
+    drop_last=True, 
+    num_workers=n_workers, 
+    pin_memory=True,           # Critical for GPU transfer
+    persistent_workers=True,
+    prefetch_factor=prefetch_factor  # Prefetch batches
+)
+
+test_loader = DataLoader(
+    test_subset, 
+    batch_size=batch_size, 
+    shuffle=False, 
+    drop_last=False, 
+    num_workers=n_workers, 
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=prefetch_factor
+)
+
+print(f"Filtered Training: {len(train_subset)} single-label images ({len(train_loader)} batches)")
+print(f"Filtered Test: {len(test_subset)} single-label images ({len(test_loader)} batches)")
+
+# %%
+label_map_bits = [
+    "111100",  # 0
+    "011100",  # 1
+    "101100",  # 2
+    "110100",  # 3
+    "111000",  # 4
+    "111110",  # 5
+    "000011",  # 6
+    "111101",  # 7
+    "001100",  # 8
+    "100011",  # 9
+    "010100",  # 10
+    "010011",  # 11
+    "001011",  # 12
+    "000111",  # 13
+]
+
+CLASS_BASIS_IDX = torch.tensor([int(b, 2) for b in label_map_bits], dtype=torch.long)
+
+assert CLASS_BASIS_IDX.ndim == 1 and CLASS_BASIS_IDX.numel() == 14, "CLASS_BASIS_IDX must have 14 entries"
+assert (CLASS_BASIS_IDX >= 0).all() and (CLASS_BASIS_IDX < 64).all(), "Basis indices must be in [0,63]"
+if CLASS_BASIS_IDX.unique().numel() < 14:
+    print("[warn] Some classes share the same basis index:", CLASS_BASIS_IDX.tolist())
+
+# %% [markdown]
+## Quantum Circuit
+
+# %%
+dev = qml.device("default.qubit", wires=n_qubits)
+
+class Entangler(Operation):
+    """
+    p : integer pattern index
+    wires : wires to apply on
+    """
+    num_params = 1
+
+    @staticmethod
+    def braided_pairs(n, p):
+        B = n//2
+        pairs=[]
+        for k in range(B):
+            a = 2*k
+            b = 2*((k+p)%B) + 1
+            pairs.append((a,b))
+        return pairs
+
+    @staticmethod
+    def compute_decomposition(p, wires):
+        ops=[]
+        n = len(wires)
+
+        pairs = Entangler.braided_pairs(n, p)
+
+        for (a,b) in pairs:
+            ops.append(qml.CZ([wires[a], wires[b]]))
+
+        return ops
+
+    def __init__(self, p, wires):
+        super().__init__(p, wires=wires)
+
+class ReUpload(Operation):
+    """
+    weights:  (q_L, n_qubits, 2, 3)
+    input:  (batch, n_qubits, 3)
+    """
+    num_params = 2
+
+    @staticmethod
+    def compute_decomposition(weights, x, wires):
+        if x.ndim == 2:
+            x = x.unsqueeze(0)
+
+        B, nq_x, _ = x.shape
+        q_L, nq_w, _, _ = weights.shape
+        assert nq_x == nq_w, "mismatch"
+
+        ops = []
+
+        for l in range(q_L):
+            for q in range(n_qubits):
+                angles = weights[l,q,0] + weights[l,q,1] * x[:,q]
+                ops.append(qml.Rot(angles[:,0], angles[:,1], angles[:,2], wires=wires[q]))
+
+            if l != q_L - 1:
+                ops.append(Entangler(int(l%(nq_w/2)), wires=wires))
+
+        return ops
+
+    @staticmethod
+    def batching_behavior(batch_size):
+        return qml.operation.BatchingRule(
+            arg_nums=[1], 
+            shape_fn=lambda shape: (batch_size,) + shape
+        )
+
+    def __init__(self, weights, input, wires):
+        super().__init__(weights, input, wires=wires)
+        
+
+@qml.qnode(dev, interface="torch", diff_method="backprop")
+def qnode(inputs, weights_a, weights_b):
+    x = inputs.reshape(inputs.shape[0], q_M, n_qubits, 3)
+
+    for q in range(n_qubits):
+        qml.Hadamard(wires=q)
+    
+    for m in range(q_M):
+        ReUpload(weights_a[m], x[:,m,...], wires=range(n_qubits))
+        qml.adjoint(ReUpload)(weights_b[m], x[:,m,...], wires=range(n_qubits))
+
+    return qml.probs(wires=range(n_qubits))
+
+
+class QuantumHead(nn.Module):
+    def __init__(self, q_M, q_L, n_qubits, n_classes, latent_dim, class_basis_idx: torch.Tensor):
+        super().__init__()
+        self.weight_shapes = {
+            "weights_a": (q_M, q_L, n_qubits, 2, 3),
+            "weights_b": (q_M, q_L, n_qubits, 2, 3)
+        }
+        self.qlayer = TorchLayer(qnode, self.weight_shapes)
+
+        self.register_buffer("class_idx", class_basis_idx.clone().detach().long())
+    
+    def forward(self, h):
+        probs_tot = self.qlayer(h)
+        probs = probs_tot.index_select(dim=1, index=self.class_idx)
+        return probs
+
+# %% [markdown]
+## Hybrid Quantum-Classical Model
+
+# %%
+class HybridQML(nn.Module):
+    def __init__(self, img_size, latent_dim, n_classes=14, model_name='medvae_8_1_2d'):
+        super().__init__()
+        self.encoder = MVAE(model_name=model_name, modality="xray")
+        self.encoder.requires_grad_(False)
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, 224, 224)
+            latent = self.encoder(dummy)
+            self.latent_shape = latent.shape
+            self.flat_dim = latent.numel()
+
+        self.flatten = nn.Flatten()
+
+        self.bottleneck = nn.Sequential(
+            nn.Linear(self.flat_dim, 4*latent_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(4*latent_dim, latent_dim),
+            nn.LayerNorm(latent_dim),
+        )    
+        
+        self.qhead = QuantumHead(q_M, q_L, n_qubits, n_classes, latent_dim, CLASS_BASIS_IDX)
+    
+    def forward(self, x):
+        latent = self.encoder.encode(x)
+        flat = self.flatten(latent)
+        angles = self.bottleneck(flat)
+        probs = self.qhead(angles)
+        return probs
+
+# %% [markdown]
+## Training Setup
+
+# %%
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+model = HybridQML(img_size=img_size, latent_dim=latent_dim, n_classes=14).to(device)
+
+# Move CLASS_BASIS_IDX to device
+CLASS_BASIS_IDX = CLASS_BASIS_IDX.to(device)
+
+with torch.no_grad():
+    model.qhead.qlayer.weights_a.uniform_(0, 2*np.pi)
+    model.qhead.qlayer.weights_b.copy_(model.qhead.qlayer.weights_a)
+
+bottleneck_lr = 2e-3
+bottleneck_wd = 2e-3
+
+main_lr = 1e-3
+main_wd = 1e-5
+
+optimizer = torch.optim.AdamW(
+    [
+        {
+            'params': model.bottleneck.parameters(),
+            'lr': bottleneck_lr,
+            'weight_decay': bottleneck_wd
+        },
+        {
+            'params': model.qhead.parameters(),
+            'lr': main_lr,
+            'weight_decay': main_wd
+        }
+    ],
+    eps=1e-8
+)
+
+# Move class_weight to device
+criterion = nn.NLLLoss(weight=class_weight.to(device), reduction='none')
+penalty = 0.05
+
+# Initialize mixed precision scaler
+scaler = GradScaler()
+
+print(f"Model initialized: {sum(p.numel() for p in model.parameters()):,} parameters\n")
+print_gpu_stats()
+
+# %% [markdown]
+## Training Functions (GPU Optimized)
+
+# %%
+def train_one_epoch(epoch):
+    model.train()
+    total, n = 0.0, 0
+    start_time = time.time()
+    sum_p_correct = 0.0
+    sum_invalid = 0.0
+
+    for i, (imgs, labels) in enumerate(train_loader):
+        # Move data to GPU with non_blocking
+        imgs = imgs.to(device, non_blocking=True)
+        targets = labels.argmax(dim=1).to(device, non_blocking=True).long()
+
+        optimizer.zero_grad(set_to_none=True)
+
+        # Mixed precision training
+        with autocast():
+            probs = model(imgs)
+            invalid_prob = 1.0 - probs.sum(dim=1)
+            log_probs = torch.log(probs.clamp(min=1e-10))
+            batch_loss = criterion(log_probs, targets)
+            loss = batch_loss.mean() + penalty * invalid_prob.mean()
+
+        # Scaled backward pass
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        # Keep computations on GPU
+        with torch.no_grad():
+            p_correct = probs[torch.arange(len(targets), device=device), targets]
+            sum_p_correct += p_correct.sum().item()
+            sum_invalid += invalid_prob.sum().item()
+            total += batch_loss.sum().item() + penalty * invalid_prob.sum().item()
+            n += imgs.size(0)
+
+    epoch_time = time.time() - start_time
+    avg_loss = total / n
+    train_accuracy = 100.0 * (sum_p_correct / n)
+    invalid_occurrence = 100.0 * (sum_invalid / n)
+    return avg_loss, epoch_time, train_accuracy, invalid_occurrence
+
+@torch.no_grad()
+def evaluate():
+    model.eval()
+    total, n = 0.0, 0
+    sum_p_correct = 0.0
+    sum_invalid = 0.0
+
+    for imgs, labels in test_loader:
+        imgs = imgs.to(device, non_blocking=True)
+        targets = labels.argmax(dim=1).to(device, non_blocking=True).long()
+
+        probs = model(imgs)
+        invalid_prob = 1.0 - probs.sum(dim=1)
+
+        log_probs = torch.log(probs.clamp(min=1e-10))
+        batch_loss = criterion(log_probs, targets)
+
+        p_correct = probs[torch.arange(len(targets), device=device), targets]
+        sum_p_correct += p_correct.sum().item()
+
+        sum_invalid += invalid_prob.sum().item()
+
+        total += batch_loss.sum().item() + penalty * invalid_prob.sum().item()
+        n += imgs.size(0)
+
+    test_loss = total / n
+    test_accuracy = 100.0 * (sum_p_correct / n)
+    invalid_occurrence = 100.0 * (sum_invalid / n)
+    return test_loss, test_accuracy, invalid_occurrence
+
+# %% [markdown]
+## Checkpoint Functions
+
+# %%
+METRICS_FILE = "training_metrics.pkl"
+CHECKPOINT_FILE = "last_checkpoint.pt"
+
+def load_metrics():
+    if os.path.exists(METRICS_FILE):
+        with open(METRICS_FILE, "rb") as f:
+            return pickle.load(f)
+    return {
+        "train_losses": [],
+        "train_accuracies": [],
+        "train_invalids": [],
+        "test_losses": [],
+        "test_accuracies": [],
+        "test_invalids": [],
+        "epoch_times": [],
+        "best_test_loss": float('inf'),
+        "best_epoch": 0,
+    }
+
+def save_metrics(metrics):
+    with open(METRICS_FILE, "wb") as f:
+        pickle.dump(metrics, f)
+
+def save_checkpoint(epoch, model, optimizer, metrics):
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": {k: v.cpu() for k, v in model.state_dict().items()},  # Move to CPU
+        "optimizer_state_dict": optimizer.state_dict(),
+        "metrics": metrics,
+    }
+    torch.save(checkpoint, CHECKPOINT_FILE)
+    print(f"[checkpoint] Saved checkpoint at epoch {epoch} → {CHECKPOINT_FILE}")
+
+def load_checkpoint(model, optimizer):
+    if not os.path.exists(CHECKPOINT_FILE):
+        print("[checkpoint] No existing checkpoint found.")
+        return 0, None
+    
+    checkpoint = torch.load(CHECKPOINT_FILE, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    print(f"[checkpoint] Loaded checkpoint from epoch {checkpoint['epoch']}")
+    return checkpoint["epoch"], checkpoint["metrics"]
+
+# %% [markdown]
+## Run Training
+
+# %%
+print(f"Training for {n_epochs} epochs...\n")
+metrics = load_metrics()
+
+start_epoch, loaded_metrics = load_checkpoint(model, optimizer)
+
+if loaded_metrics is None:
+    metrics = load_metrics()
+else:
+    metrics = loaded_metrics
+
+train_losses      = metrics.get("train_losses", [])
+train_accuracies  = metrics.get("train_accuracies", [])
+train_invalids    = metrics.get("train_invalids", [])
+test_losses       = metrics.get("test_losses", [])
+test_accuracies   = metrics.get("test_accuracies", [])
+test_invalids     = metrics.get("test_invalids", [])
+epoch_times       = metrics.get("epoch_times", [])
+
+best_test_loss = metrics.get("best_test_loss", float('inf'))
+best_epoch     = metrics.get("best_epoch", 0)
+
+best_model = None
+epochs_since_improvement = 0
+improvement_patience = 5000
+
+plot_display_id = "training_plot"
+_first_plot_done = False
+
+total_start = time.time()
+
+for epoch in range(start_epoch + 1, n_epochs + 1):       
+    train_loss, epoch_time, train_acc, train_invalid = train_one_epoch(epoch)
+    test_loss, test_acc, test_invalid = evaluate()
+
+    # Record metrics
+    train_losses.append(train_loss)
+    train_accuracies.append(train_acc)
+    train_invalids.append(train_invalid)
+    test_losses.append(test_loss)
+    test_accuracies.append(test_acc)
+    test_invalids.append(test_invalid)
+    epoch_times.append(epoch_time)
+
+    metrics["train_losses"]     = train_losses
+    metrics["train_accuracies"] = train_accuracies
+    metrics["train_invalids"]   = train_invalids
+    metrics["test_losses"]      = test_losses
+    metrics["test_accuracies"]  = test_accuracies
+    metrics["test_invalids"]    = test_invalids
+    metrics["epoch_times"]      = epoch_times
+    metrics["best_test_loss"]   = best_test_loss
+    metrics["best_epoch"]       = best_epoch
+    
+    save_metrics(metrics)
+    save_checkpoint(epoch, model, optimizer, metrics)
+
+    # Track best model
+    if test_loss < best_test_loss:
+        best_test_loss = test_loss
+        best_epoch = epoch
+        epochs_since_improvement = 0
+        best_model = {
+            'epoch': epoch,
+            'model_state_dict': {k: v.cpu() for k, v in model.state_dict().items()},
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss': train_loss,
+            'test_loss': test_loss,
+            'test_acc': test_acc,
+            'invalid_occ': test_invalid
+        }
+    else:
+        epochs_since_improvement += 1
+
+    # Plot update
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+    epochs_range = range(1, len(train_losses) + 1)
+
+    # Loss plot
+    ax1.plot(epochs_range, train_losses, 'b-o', label='Train Loss', linewidth=2, markersize=3)
+    ax1.plot(epochs_range, test_losses, 'r-o', label='Test Loss', linewidth=2, markersize=3)
+    ax1.axhline(y=best_test_loss, color='g', linestyle='--', label=f'Best ({best_test_loss:.4f})', linewidth=1)
+    ax1.set_xlabel('Epoch', fontsize=12)
+    ax1.set_ylabel('Loss', fontsize=12)
+    ax1.set_title('Loss Progress', fontsize=14)
+    ax1.legend(fontsize=10)
+    ax1.grid(True, alpha=0.3)
+
+    # Accuracy/Invalid plot
+    ax2.plot(epochs_range, train_accuracies, 'b-^', label='Train Acc', linewidth=2, markersize=3)
+    ax2.plot(epochs_range, test_accuracies, 'r-^', label='Test Acc', linewidth=2, markersize=3)
+    ax2.plot(epochs_range, train_invalids, 'b--s', label='Train Invalid', linewidth=1, markersize=3)
+    ax2.plot(epochs_range, test_invalids, 'r--s', label='Test Invalid', linewidth=1, markersize=3)
+    ax2.set_xlabel('Epoch', fontsize=12)
+    ax2.set_ylabel('Percent (%)', fontsize=12)
+    ax2.set_title('Accuracy & Invalid %', fontsize=14)
+    ax2.legend(fontsize=10)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    
+    if not _first_plot_done:
+        display(fig, display_id=plot_display_id)
+        _first_plot_done = True
+    else:
+        update_display(fig, display_id=plot_display_id)
+    plt.close(fig)
+
+    print(f"{'='*80}")
+    print(f"Epoch {epoch} | {epoch_time:.1f}s | Train Loss: {train_loss:.5f} | Train Acc: {train_acc:.2f}% | Train Invalid: {train_invalid:.2f}%")
+    print(f"Test Loss: {test_loss:.5f} | Best: {best_test_loss:.5f} ({best_epoch}) | Test Acc: {test_acc:.2f}% | Test Invalid: {test_invalid:.2f}%")
+    
+    # Print gradient stats
+    with torch.no_grad():
+        qg = []
+        og = []
+        for name, p in model.named_parameters():
+            if p.grad is None:
+                continue
+            if "qhead.qlayer" in name:
+                qg.append(p.grad.flatten())
+            else:
+                og.append(p.grad.flatten())
+
+        if qg:
+            qg = torch.cat(qg)
+            print(f"QLAYER grad mean={qg.mean():.4e} var={qg.var():.4e}")
+        if og:
+            og = torch.cat(og)
+            print(f"OTHER  grad mean={og.mean():.4e} var={og.var():.4e}")
+    
+    # Print GPU stats every 5 epochs
+    if epoch % 5 == 0:
+        print_gpu_stats()
+
+    if epochs_since_improvement >= improvement_patience:
+        print(f"\nEarly stopping triggered after {epoch} epochs — "
+              f"no improvement for {epochs_since_improvement} consecutive epochs.")
+        break
+
+total_time = time.time() - total_start
+print(f"\nTraining complete in {total_time/60:.2f} minutes.")
+
+# Save best model
+if best_model is not None:
+    torch.save(best_model, 'best_model.pt')
+    print(f"Best model (epoch {best_model['epoch']}) written to: best_model.pt "
+          f"(Test Loss: {best_model['test_loss']:.5f}, Test Acc: {best_model['test_acc']:.2f}%)")
+else:
+    print("No best model found during training; nothing written to disk.")
+
+# %% [markdown]
+## Summarize Training
+
+# %%
+print(f"Training Statistics:")
+print(f"  Total epochs: {len(train_losses)}")
+print(f"  Total time: {total_time/60:.1f} minutes ({total_time:.1f} seconds)")
+print(f"  Average time per epoch: {np.mean(epoch_times):.1f} seconds")
+print(f"\nLoss Progression:")
+print(f"  Initial train loss: {train_losses[0]:.4f}")
+print(f"  Final train loss: {train_losses[-1]:.4f}")
+print(f"  Improvement: {(train_losses[0] - train_losses[-1])/train_losses[0]*100:.1f}%")
+print(f"\nInitial test loss: {test_losses[0]:.4f}")
+print(f"  Final test loss: {test_losses[-1]:.4f}")
+print(f"  Best test loss: {best_test_loss:.4f} (Epoch {best_epoch})")
+print(f"  Improvement: {(test_losses[0] - best_test_loss)/test_losses[0]*100:.1f}%")
+
+if len(test_accuracies) > 0:
+    best_test_acc = max(test_accuracies)
+    print(f"\nTest Accuracy Progression:")
+    print(f"  Initial test accuracy: {test_accuracies[0]:.2f}%")
+    print(f"  Final test accuracy: {test_accuracies[-1]:.2f}%")
+    print(f"  Best test accuracy: {best_test_acc:.2f}%")
+else:
+    print("\nNo test accuracy values recorded.")
+
+print(f"\nModel saved as: best_model.pt")
+print(f"\nPerformance:")
+print(f"  Training time: {total_time/60:.1f} minutes")
+
+print_gpu_stats()
+
+# %%
+# Plot final training curves
+plt.figure(figsize=(15, 5))
+
+# Loss plot
+plt.subplot(1, 3, 1)
+epochs_range = range(1, len(train_losses) + 1)
+plt.plot(epochs_range, train_losses, 'b', label='Train Loss', linewidth=2)
+plt.plot(epochs_range, test_losses, 'r', label='Test Loss', linewidth=2)
+plt.axhline(y=best_test_loss, color='g', linestyle='--', 
+            label=f'Best Test ({best_test_loss:.4f})', linewidth=1)
+plt.xlabel('Epoch', fontsize=12)
+plt.ylabel('Loss', fontsize=12)
+plt.title('Training Progress', fontsize=14, fontweight='bold')
+plt.legend(fontsize=10)
+plt.grid(True, alpha=0.3)
+
+# Accuracy plot
+plt.subplot(1, 3, 2)
+plt.plot(epochs_range, train_accuracies, 'b-^', label='Train Acc', linewidth=2, markersize=4)
+plt.plot(epochs_range, test_accuracies, 'r-^', label='Test Acc', linewidth=2, markersize=4)
+plt.xlabel('Epoch', fontsize=12)
+plt.ylabel('Accuracy (%)', fontsize=12)
+plt.title('Accuracy Progress', fontsize=14, fontweight='bold')
+plt.legend(fontsize=10)
+plt.grid(True, alpha=0.3)
+
+# Time per epoch
+plt.subplot(1, 3, 3)
+plt.bar(epochs_range, epoch_times, color='steelblue', alpha=0.7)
+plt.axhline(y=np.mean(epoch_times), color='r', linestyle='--', 
+            label=f'Average ({np.mean(epoch_times):.1f}s)', linewidth=2)
+plt.xlabel('Epoch', fontsize=12)
+plt.ylabel('Time (seconds)', fontsize=12)
+plt.title('Time per Epoch', fontsize=14, fontweight='bold')
+plt.legend(fontsize=10)
+plt.grid(True, alpha=0.3, axis='y')
+
+plt.tight_layout()
+plt.savefig('training_results.png', dpi=150, bbox_inches='tight')
+print("\nTraining curves saved as: training_results.png")
+plt.show()
+
+# %% [markdown]
+## Save Final Model
+
+# %%
+# Save final model and training history
+torch.save({
+    'n_epochs': len(train_losses),
+    'final_epoch': len(train_losses),
+    'model_state_dict': {k: v.cpu() for k, v in model.state_dict().items()},
+    'optimizer_state_dict': optimizer.state_dict(),
+    'train_losses': train_losses,
+    'test_losses': test_losses,
+    'test_accuracies': test_accuracies,
+    'train_accuracies': train_accuracies,
+    'train_invalids': train_invalids,
+    'test_invalids': test_invalids,
+    'epoch_times': epoch_times,
+    'best_test_loss': best_test_loss,
+    'best_epoch': best_epoch,
+    'config': {
+        'n_qubits': n_qubits,
+        'q_M': q_M,
+        'q_L': q_L,
+        'latent_dim': latent_dim,
+        'img_size': img_size,
+        'batch_size': batch_size,
+    }
+}, 'final_model_complete.pt')
+
+print("\nComplete training history saved as: final_model_complete.pt")
+print("\nThis includes:")
+print("  - Final model weights")
+print("  - All loss curves")
+print("  - Training times")
+print("  - Configuration")
+print("\n" + "="*80)
+print("TRAINING COMPLETE!")
+print("="*80)
