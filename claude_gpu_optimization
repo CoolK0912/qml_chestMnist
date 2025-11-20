@@ -1,3 +1,11 @@
+import sys
+import subprocess
+
+# Install medvae in the current kernel's Python environment
+subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'medvae'])
+
+-----------------------------------------
+
 # %% [markdown]
 # # Quantum-Classical Hybrid Autoencoder for Medical Image Classification (GPU Optimized)
 # 
