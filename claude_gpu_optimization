@@ -352,7 +352,14 @@ class HybridQML(nn.Module):
 ## Training Setup
 
 # %%
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# For Mac with Apple Silicon (M1/M2/M3)
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")  # Apple Silicon GPU
+else:
+    device = torch.device("cpu")
+
 print(f"Using device: {device}")
 
 model = HybridQML(img_size=img_size, latent_dim=latent_dim, n_classes=14).to(device)
