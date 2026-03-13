@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Model weights (large binaries)
+*.pt
+*.pth
+*.ckpt
+
+# Conda installers
+Miniconda*.sh
+Anaconda*.sh
+
+# Experiment tracking
+wandb/
+*.log
+results/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Outputs
+outputs/
+logs/
