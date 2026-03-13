@@ -1,0 +1,229 @@
+╔══════════════════════════════════════════════════════════════════════════╗
+║                    PURDUE SCHOLAR CLUSTER DEPLOYMENT                     ║
+║              Quantum-Classical Hybrid Autoencoder Training               ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+📋 PRE-DEPLOYMENT CHECKLIST
+═══════════════════════════════════════════════════════════════════════════
+
+□ 1. DOWNLOAD ALL FILES
+   - Download all files from this directory to your local machine
+   - Keep the directory structure intact
+
+□ 2. TRANSFER TO SCHOLAR CLUSTER
+   Methods:
+   a) Using SCP:
+      scp -r quantum_xray/ yournetid@scholar.rcac.purdue.edu:~/
+   
+   b) Using FileZilla/WinSCP (GUI):
+      - Host: scholar.rcac.purdue.edu
+      - Upload the quantum_xray folder
+   
+   c) Using Scholar Data Depot (web interface):
+      - Visit: https://depot.rcac.purdue.edu/
+
+□ 3. VERIFY FILE PERMISSIONS
+   ssh yournetid@scholar.rcac.purdue.edu
+   cd quantum_xray
+   chmod +x *.sh
+
+□ 4. CUSTOMIZE FOR YOUR DATA
+   Edit preprocess.py:
+   - Set DATA_ROOT to your actual data path
+   - OR leave as-is to use MedMNIST (will auto-download)
+   
+   Key line to change:
+   DATA_ROOT = "/path/to/your/data"  # Line 17
+
+□ 5. UPDATE EMAIL NOTIFICATIONS
+   Edit submit_job.sh:
+   - Change: #SBATCH --mail-user=your_email@purdue.edu
+   - Line 12
+
+□ 6. SETUP ENVIRONMENT (ONE TIME)
+   ./setup_env.sh
+   
+   Wait ~10-15 minutes for installation
+
+□ 7. TEST INTERACTIVELY (RECOMMENDED)
+   # Request interactive GPU session
+   srun -A scholar --partition=gpu --gres=gpu:1 --time=00:30:00 --pty bash
+   
+   # Activate environment
+   module load anaconda
+   source activate quantum_ml
+   
+   # Test data loading
+   python preprocess.py
+   
+   # Quick training test (edit train.py first: n_epochs=2)
+   python train.py
+   
+   # Exit when satisfied
+   exit
+
+□ 8. SUBMIT PRODUCTION JOB
+   mkdir -p logs
+   sbatch submit_job.sh
+
+□ 9. MONITOR PROGRESS
+   # Check job status
+   squeue -u $USER
+   
+   # Watch output
+   tail -f logs/quantum_*.out
+   
+   # Check for errors
+   tail -f logs/quantum_*.err
+
+□ 10. RETRIEVE RESULTS
+   After training completes, download from Scholar:
+   scp -r yournetid@scholar.rcac.purdue.edu:~/quantum_xray/outputs ./
+
+
+═══════════════════════════════════════════════════════════════════════════
+📁 FILE DESCRIPTIONS
+═══════════════════════════════════════════════════════════════════════════
+
+CORE FILES (Required):
+  ✓ train.py                - Main training script (improved optimizer)
+  ✓ preprocess.py          - Data loading (CUSTOMIZE THIS!)
+  ✓ submit_job.sh          - SLURM job submission script
+  ✓ setup_env.sh           - Environment setup script
+  ✓ requirements.txt       - Python dependencies
+
+DOCUMENTATION:
+  ✓ README.md              - Complete instructions
+  ✓ QUICKSTART.sh          - Quick reference commands
+  ✓ CHECKLIST.txt          - This file
+
+OPTIMIZER IMPROVEMENTS:
+  ✓ QUICK_FIX.py           - Exact code changes for more noise
+  ✓ improved_training_setup.py - Alternative training configs
+  ✓ optimizer_experiments.py   - 6 different optimizer strategies
+
+HELPER SCRIPTS:
+  ✓ request_interactive.sh - Interactive session helper
+
+
+═══════════════════════════════════════════════════════════════════════════
+⚙️  KEY PARAMETERS
+═══════════════════════════════════════════════════════════════════════════
+
+JOB RESOURCES (submit_job.sh):
+  - GPUs: 1
+  - CPUs: 8 cores
+  - Memory: 64 GB
+  - Time limit: 24 hours
+  - Partition: gpu
+
+TRAINING CONFIG (train.py):
+  - Batch size: 64
+  - Image size: 224x224
+  - Qubits: 6
+  - Quantum layers: 6
+  - Epochs: 300 (with early stopping)
+
+IMPROVED OPTIMIZER:
+  - Learning rate: 3e-4 (6x higher!)
+  - Weight decay: 1e-4 (10x higher)
+  - Epsilon: 1e-5 (100x higher - adds gradient noise)
+  - Beta1: 0.85 (more noise through less momentum)
+  - Scheduler: Cosine annealing with warm restarts
+
+
+═══════════════════════════════════════════════════════════════════════════
+🎯 EXPECTED OUTCOMES
+═══════════════════════════════════════════════════════════════════════════
+
+With improved optimizer settings:
+  - Should see accuracy > 10-15% quickly (vs original 8-9%)
+  - More training instability (good! that's the noise working)
+  - Occasional loss spikes (from LR restarts - expected)
+  - Better exploration of parameter space
+
+Training time (on single A100):
+  - ~75 seconds per epoch
+  - ~300 epochs max (early stopping around epoch 100-150)
+  - Total: 6-8 hours
+
+Output files (in outputs/ directory):
+  - best_model.pt - Best checkpoint by validation loss
+  - final_model_complete.pt - Complete training history
+  - training_results.png - Loss and time plots
+  - checkpoint_epoch_*.pt - Periodic checkpoints
+
+
+═══════════════════════════════════════════════════════════════════════════
+⚠️  TROUBLESHOOTING
+═══════════════════════════════════════════════════════════════════════════
+
+PROBLEM: Out of Memory (OOM)
+SOLUTION: Reduce batch_size in train.py
+  batch_size = 32  # or 16 if still failing
+
+PROBLEM: Job killed (time limit)
+SOLUTION: Increase time in submit_job.sh
+  #SBATCH --time=48:00:00
+
+PROBLEM: Slow data loading
+SOLUTION: Increase workers in train.py
+  n_workers = 16  # match your CPU count
+
+PROBLEM: CUDA out of memory
+SOLUTION: Reduce batch size and/or image size
+  batch_size = 32
+  img_size = 128  # instead of 224
+
+PROBLEM: ModuleNotFoundError
+SOLUTION: Ensure environment activated
+  module load anaconda
+  source activate quantum_ml
+
+PROBLEM: Data not found
+SOLUTION: Check DATA_ROOT in preprocess.py
+  ls -la /path/to/your/data  # verify exists
+
+PROBLEM: Permission denied
+SOLUTION: Make scripts executable
+  chmod +x *.sh
+
+
+═══════════════════════════════════════════════════════════════════════════
+📞 GETTING HELP
+═══════════════════════════════════════════════════════════════════════════
+
+Scholar Documentation:
+  https://www.rcac.purdue.edu/knowledge/scholar
+
+RCAC Support:
+  scholar-help@purdue.edu
+
+Check Queue Status:
+  https://www.rcac.purdue.edu/compute/scholar
+
+Common Commands:
+  mybalance              # Check allocation usage
+  squeue -u $USER        # Check your jobs
+  sinfo -p gpu          # Check GPU availability
+  scancel <jobid>       # Cancel a job
+
+
+═══════════════════════════════════════════════════════════════════════════
+✅ DEPLOYMENT COMPLETE
+═══════════════════════════════════════════════════════════════════════════
+
+Once you've completed all checklist items above:
+
+1. Your environment is set up
+2. Your data is configured
+3. Your job is running on Scholar
+4. Results will be in outputs/ directory
+
+The improved optimizer with added noise should help escape the poor
+local minima causing 8-9% accuracy. Monitor the training logs to see
+if accuracy improves beyond 10-15% in the first 10-20 epochs.
+
+Good luck with your quantum machine learning research!
+
+═══════════════════════════════════════════════════════════════════════════
