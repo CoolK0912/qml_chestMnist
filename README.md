@@ -52,7 +52,7 @@ QML Project/
 │   ├── QUICK_FIX.py          # Optimizer tuning notes
 │   ├── QUICKSTART.sh
 │   └── README.md             # Scholar cluster deployment guide
-├── Slurm Stuff/              # Additional SLURM utilities
+├── slurm/                    # Additional SLURM utilities
 ├── requirements.txt          # Root-level Python dependencies (same as scholar/)
 ├── .gitignore
 └── README.md
